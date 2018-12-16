@@ -1,0 +1,2 @@
+{:deps {org.clojure/java.jdbc {:mvn/version "0.7.8"}
+        com.h2database/h2 {:mvn/version "1.4.197"}}}
