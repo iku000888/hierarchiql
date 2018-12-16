@@ -4,6 +4,7 @@
 (require '[honeysql.format :as h])
 (require '[honeysql.helpers :as hp])
 (require '[clojure.java.jdbc :as j])
+(require '[clojure.walk :as w])
 
 (def h2-db {:dbtype "h2:mem"
             :dbname "clojure_test_h2"})
@@ -49,30 +50,65 @@
   (cond (string? v) "string"
         (integer? v) "int"))
 
+(defn transact-1 [db vals {:keys [tx-id components]}]
+  (let [transaction-id (or tx-id
+                           (:id (first (j/insert! db :transactions {}))))]
+    (doall
+     (map (fn [[k v]]
+            (let [v-type (if ((or components #{}) k)
+                           "entities"
+                           (v->table v))
+                  v-id (when-not (= v-type "entities")
+                         (if-let [v-id (-> (hp/select :*)
+                                           (hp/from (keyword v-type))
+                                           (hp/where [:= :value v])
+                                           h/format
+                                           (->> (j/query db))
+                                           first
+                                           :id)]
+                           v-id
+                           (-> (j/insert! db (keyword v-type)
+                                          {:value v})
+                               first
+                               :id)))]
+              (merge (first (j/insert!
+                             h2-db
+                             :entities
+                             {:attribute_ns (namespace k)
+                              :attribute_name (name k)
+                              :value_type (if (= v-type "entities")
+                                            "entities"
+                                            (v->table v))
+                              :value_id (if (= v-type "entities")
+                                          v
+                                          v-id)
+                              :transaction_id transaction-id}))
+                     {:transaction_id transaction-id})))
+          vals))))
+
+(defn map->component-keys [m db-id-store]
+  (->> m
+       (filter (comp #(get db-id-store %) second))
+       (map first)
+       set))
+
 (defn transact [db vals]
-  (let [transaction-id (:id (first (j/insert! h2-db :transactions {})))]
-    (doseq [[k v] vals]
-      (let [v-type (v->table v)
-            v-id (if-let [v-id (-> (hp/select :*)
-                                   (hp/from (keyword v-type))
-                                   (hp/where [:= :value v])
-                                   h/format
-                                   (->> (j/query db))
-                                   first
-                                   :id)]
-                   v-id
-                   (-> (j/insert! db (keyword v-type)
-                                  {:value v})
-                       first
-                       :id))]
-        (j/insert!
-         h2-db
-         :entities
-         {:attribute_ns (namespace k)
-          :attribute_name (name k)
-          :value_type (v->table v)
-          :value_id v-id
-          :transaction_id transaction-id})))))
+  (let [db-id-store (atom {})
+        transaction-id (:id (first (j/insert! h2-db :transactions {})))]
+    (->> vals
+         (map (fn [v]
+                (let [tmp-db-id (:db/id v)
+                      ckeys (map->component-keys v @db-id-store)
+                      inserted (:id (first (transact-1 db
+                                                       (->> (dissoc v :db/id)
+                                                            (map (fn [[k v]]
+                                                                   {k (get @db-id-store v v)}))
+                                                            (into {}))
+                                                       {:tx-id transaction-id
+                                                        :components ckeys})))]
+                  (when tmp-db-id
+                    (swap! db-id-store assoc tmp-db-id inserted)))))
+         doall)))
 
 (defn find-entity-1 [db input-id]
   (-> (hp/select :*)
@@ -82,24 +118,46 @@
       (->> (j/query db))
       first))
 
-(defn pull-1 [db input-id]
+(defn pull-1 [db input-id {:keys [exclude-ids]}]
   (let [{:keys [transaction_id]} (find-entity-1 db input-id)
         siblings (-> (hp/select :*)
                      (hp/from :entities)
                      (hp/where [:= :transaction_id transaction_id])
                      h/format
-                     (->> (j/query db)))]
+                     (->> (j/query db)
+                          (map (fn [v]
+                                 {(:id v) v}))
+                          (into {})))
+        component-ids (->> siblings
+                           (filter #(= (:value_type (second %)) "entities"))
+                           (map (comp :value_id second))
+                           (set))]
     (->> siblings
-         (map (fn [{:keys [id attribute_ns attribute_name
-                           value_type value_id t transaction_id]}]
-                {(keyword attribute_ns attribute_name)
-                 (-> (hp/select :value)
-                     (hp/from (keyword value_type))
-                     (hp/where [:= :id value_id])
-                     h/format
-                     (->> (j/query db))
-                     first
-                     :value)}))
+         (keep (fn [[id {:keys [id attribute_ns attribute_name
+                                value_type value_id t transaction_id]}]]
+                 (cond
+                   (component-ids id) nil
+                   (= value_type "entities")
+                   {(keyword attribute_ns attribute_name)
+                    (let [{:keys [id attribute_ns attribute_name
+                                  value_type value_id t transaction_id]}
+                          (get siblings value_id)]
+                      {(keyword attribute_ns attribute_name)
+                       (-> (hp/select :value)
+                           (hp/from (keyword value_type))
+                           (hp/where [:= :id value_id])
+                           h/format
+                           (->> (j/query db))
+                           first
+                           :value)})}
+                   :default {(keyword attribute_ns attribute_name)
+                             (-> (hp/select :value)
+                                 (hp/from (keyword value_type))
+                                 (hp/where [:= :id value_id])
+                                 h/format
+                                 (->> (j/query db))
+                                 first
+                                 :value)})))
          (into {}))))
 
 (defn find [db attr v]
@@ -112,15 +170,28 @@
             first)]
     (-> (hp/select :*)
         (hp/from :entities)
-        (hp/where [:= :value_id id])
+        (hp/where [:= :value_id id]
+                  [:= :attribute_ns (namespace attr)]
+                  [:= :attribute_name (name attr)])
         h/format
         (->> (j/query db)))))
 
 (comment
-  (transact h2-db {:foo/bar "foo"
-                   :foo/int 3})
-  (pull-1 h2-db 1)
-  (find h2-db :foo/bar "foo")
+  (transact-1 h2-db {:bar/baz "boo"} nil)
+  (transact-1 h2-db {:foo/bar "foo"
+                     :foo/int 3
+                     :foo/component 1} nil)
+  (transact h2-db
+            [{:db/id "barbaz"
+              :bar/baz "boo"}
+             {:foo/bar "foo"
+              :foo/int 3
+              :foo/component "barbaz"}])
+  (pull-1 h2-db 1 {})
+
+  (pull-1 h2-db 4 {})
+
+  (find h2-db :bar/baz "boo")
   (j/query h2-db "select * from entities")
   (j/query h2-db "select * from string")
   (j/query h2-db "select * from int"))
