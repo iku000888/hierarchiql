@@ -124,48 +124,19 @@
 (defn find-entity-1 [db input-id]
   (-> (hp/select :*)
       (hp/from :entities)
-      (hp/where [:= :id input-id])
+      (hp/where [:= :eid input-id])
       h/format
       (->> (j/query db))
       first))
 
 (defn pull-recursive [db m])
 
-(defn pull-1 [db input-id {:keys [exclude-ids]}]
-  (let [{:keys [eid]} (find-entity-1 db input-id)
-        siblings (-> (hp/select :*)
-                     (hp/from :entities)
-                     (hp/where [:= :eid eid])
-                     h/format
-                     (->> (j/query db)))]
-    siblings
-    #_(->> siblings
-           (keep (fn [[id {:keys [id attribute_ns attribute_name
-                                  value_type value_id t transaction_id]}]]
-                   (cond
-                     (component-ids id) nil
-                     (= value_type "entities")
-                     {(keyword attribute_ns attribute_name)
-                      (let [{:keys [id attribute_ns attribute_name
-                                    value_type value_id t transaction_id]}
-                            (get siblings value_id)]
-                        {(keyword attribute_ns attribute_name)
-                         (-> (hp/select :value)
-                             (hp/from (keyword value_type))
-                             (hp/where [:= :id value_id])
-                             h/format
-                             (->> (j/query db))
-                             first
-                             :value)})}
-                     :default {(keyword attribute_ns attribute_name)
-                               (-> (hp/select :value)
-                                   (hp/from (keyword value_type))
-                                   (hp/where [:= :id value_id])
-                                   h/format
-                                   (->> (j/query db))
-                                   first
-                                   :value)})))
-           (into {}))))
+(defn pull-1 [db input-eid {:keys [exclude-ids]}]
+  (-> (hp/select :*)
+      (hp/from :entities)
+      (hp/where [:= :eid input-eid])
+      h/format
+      (->> (j/query db))))
 
 (defn find [db attr v]
   (let [{:keys [id value]}
@@ -182,6 +153,15 @@
                   [:= :attribute_name (name attr)])
         h/format
         (->> (j/query db)))))
+
+(defn parent-entity [db eid]
+  (-> (hp/select :*)
+      (hp/from :entities)
+      (hp/where [:= :value_id eid]
+                [:= :value_type "entities"])
+      h/format
+      (->> (j/query db))
+      first))
 
 (defn expand-results [db res]
   (w/prewalk
@@ -247,6 +227,13 @@
   (pull-* h2-db 4)
 
   (find h2-db :voo/doo 493)
+  (parent-entity h2-db 1)
+  (parent-entity h2-db 2)
+  (parent-entity h2-db 3)
+
+  (pull-1 h2-db 3 {})
+  (pull-* h2-db 3)
+
   (j/query h2-db "select * from entities")
   (j/query h2-db "select * from string")
   (j/query h2-db "select * from int"))
